@@ -34,8 +34,8 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
           # ---- EDIT THESE TWO ----
-          LIPUTON_URL: "https://www.liputon.fi/bargains"
-          MAX_PRICE:   "150"
+          LIPUTON_URL: "https://www.liputon.fi/events/110487"
+          MAX_PRICE:   "230"
           # If you use the general bargains page above, uncomment the next line.
           # If you point LIPUTON_URL at the Ruisrock-specific page, leave it out.
           # EVENT_KEYWORD: "ruisrock"
