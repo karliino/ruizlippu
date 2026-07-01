@@ -2,7 +2,7 @@ name: Liputon Ruisrock monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every ~10 min (GitHub may delay it a little)
+    - cron: "*/5 * * * *"   # every ~10 min (GitHub may delay it a little)
   workflow_dispatch: {}        # lets you run it manually to test
 
 permissions:
