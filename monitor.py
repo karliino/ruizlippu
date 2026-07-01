@@ -2,23 +2,18 @@
 """
 Liputon.fi resale monitor
 --------------------------
-Pings a Telegram chat when a matching ticket (e.g. a 3-day Ruisrock pass)
-appears at or below a price you set.
+Pings a Telegram chat when a 3-day Ruisrock ticket is being SOLD (the seller's
+asking price / HINTA) at or below a price you set.
 
-It opens the page in a headless browser and reads it like a real visitor,
-so there is NO hidden API URL to grab. You just point it at the page.
+It deliberately reads HINTA (asking price), NOT ALKUP. HINTA (original price).
+It opens the page in a headless browser, so there is no hidden API to grab.
 
-Config comes from environment variables (set in the GitHub workflow):
+Environment variables (set in the GitHub workflow):
   TELEGRAM_BOT_TOKEN   (secret)  token from @BotFather
   TELEGRAM_CHAT_ID     (secret)  your numeric Telegram user id
-  LIPUTON_URL          the resale page to watch (Ruisrock 3-day event page)
-  MAX_PRICE            only alert on matches at or below this many euros
-  EVENT_KEYWORD        optional: a word that must appear (e.g. "ruisrock").
-                       Leave empty if LIPUTON_URL is already event-specific.
-
-State (which listings you've already been told about) is kept in state.json,
-which the workflow commits back so you don't get re-alerted about the same
-listing every run.
+  LIPUTON_URL          the Ruisrock resale page to watch
+  MAX_PRICE            only alert when the ASKING price is <= this (euros)
+  EVENT_KEYWORD        optional safety filter, e.g. "ruisrock" (usually not needed)
 """
 
 import os
@@ -26,43 +21,40 @@ import re
 import json
 import hashlib
 import pathlib
+import urllib.parse
+import urllib.request
 
 from playwright.sync_api import sync_playwright
 
-# ---------------------------------------------------------------- config ----
+
 def _req(name):
     v = os.environ.get(name)
     if not v:
         raise SystemExit(f"Missing required environment variable: {name}")
     return v
 
+
 BOT_TOKEN     = _req("TELEGRAM_BOT_TOKEN")
 CHAT_ID       = _req("TELEGRAM_CHAT_ID")
-URL           = os.environ.get("LIPUTON_URL", "https://www.liputon.fi/bargains").strip()
-MAX_PRICE     = float(os.environ.get("MAX_PRICE", "150").replace(",", "."))
+URL           = os.environ.get("LIPUTON_URL", "https://www.liputon.fi/events/110487").strip()
+MAX_PRICE     = float(os.environ.get("MAX_PRICE", "170").replace(",", "."))
 EVENT_KEYWORD = os.environ.get("EVENT_KEYWORD", "").strip().lower()
 
 STATE = pathlib.Path("state.json")
 
-# ------------------------------------------------------------- matching -----
-# Counts as a 3-day / weekend pass.
-THREE_DAY = re.compile(
-    r"(3\s*-?\s*(?:pv|paiv|päiv|day|vrk)|kolmen\s+paiv|kolmen\s+päiv|3\s*-?\s*day|viikonlopp|weekend)",
-    re.I,
-)
-# Obvious single-/two-day labels we do NOT want. The "3" anchor above already
-# filters most of these, this is just belt-and-suspenders.
-NOT_THREE = re.compile(
-    r"(paivalippu|päivälippu|1\s*-?\s*(?:pv|paiv|päiv|day)|yhden\s+paiv|yhden\s+päiv|"
-    r"2\s*-?\s*(?:pv|paiv|päiv|day)|kahden\s+paiv|kahden\s+päiv)",
-    re.I,
-)
-# A euro amount anywhere in a blob of text.
+# A euro amount, either "236,00 €" or "€ 236,00".
 EURO = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*€|€\s*(\d{1,4}(?:[.,]\d{1,2})?)")
+# The listing format puts the number before the € sign.
+EURO_NUM = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*€")
+# Marks a 3-day / weekend pass.
+MARKER = re.compile(
+    r"3\s*-?\s*(?:PÄIVÄÄ|PAIVAA|PÄIVÄN|PAIVAN|päivää|päivän|paivaa|paivan|pv|vrk)"
+    r"|kolmen\s+päiv|kolmen\s+paiv|3-day\b|3 day\b",
+    re.I,
+)
 
 
 def to_price(value):
-    """Parse '120', '120,00', '120.00 €', 120 -> 120.0  (or None)."""
     if isinstance(value, (int, float)):
         return float(value)
     s = str(value)
@@ -80,79 +72,39 @@ def to_price(value):
         return None
 
 
-def is_match(text, price):
-    """True if the text looks like a 3-day pass for the wanted event."""
-    if price is None or price > MAX_PRICE:
-        return False
-    if not THREE_DAY.search(text):
-        return False
-    if NOT_THREE.search(text):
-        return False
-    if EVENT_KEYWORD and EVENT_KEYWORD not in text.lower():
-        return False
-    return True
-
-
-def fingerprint(text, price):
-    norm = re.sub(r"\s+", " ", text.lower()).strip()[:160]
-    return hashlib.sha1(f"{round(price, 2)}|{norm}".encode()).hexdigest()[:16]
-
-
-# ------------------------------------------------- pull data from the page --
-def walk_json(obj, out):
-    """Recursively find record-like dicts that carry a price + text."""
-    if isinstance(obj, dict):
-        blob = " ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float)))
-        price = None
-        for k, v in obj.items():
-            if re.search(r"price|hinta|amount|eur", str(k), re.I):
-                price = to_price(v) or price
-        if price is None:
-            price = to_price(blob)
-        if price is not None and THREE_DAY.search(blob):
-            out.append((blob[:200], price))
-        for v in obj.values():
-            walk_json(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            walk_json(v, out)
-
-
-def scan_text(text, out):
-    """Fallback: slide a small window over the rendered page text."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    window = 6
-    for i, line in enumerate(lines):
-        if not EURO.search(line):
+def parse_listings(text):
+    """
+    For each 3-day pass, the ASKING price (HINTA) is the first euro amount
+    after the '3 PÄIVÄÄ' marker; the original price (ALKUP. HINTA) is the
+    second. Returns one record per listing.
+    """
+    out = []
+    for m in MARKER.finditer(text):
+        after = text[m.end(): m.end() + 150]
+        euros = EURO_NUM.findall(after)
+        if not euros:
             continue
-        blob = " ".join(lines[max(0, i - window): i + window])
-        price = to_price(line) or to_price(blob)
-        if price is not None and THREE_DAY.search(blob):
-            out.append((blob[:200], price))
+        ask = to_price(euros[0])
+        orig = to_price(euros[1]) if len(euros) > 1 else None
+        head = re.split(r"(?i)paikka", text[max(0, m.start() - 60): m.start()])[-1]
+        tname = head.strip() or "3-day"
+        out.append({
+            "type": tname[:40],
+            "ask": ask,
+            "orig": orig,
+            "ctx": (tname + " " + after).lower(),
+        })
+    return out
 
 
-def collect():
-    matches = []
-    captured_json = []
-
+def render_text(url):
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(locale="fi-FI")
-
-        def on_response(resp):
-            try:
-                if "application/json" in resp.headers.get("content-type", ""):
-                    captured_json.append(resp.json())
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
         try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
             print("Navigation warning:", e)
-
         # Best-effort cookie accept so listings render.
         for sel in (
             "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
@@ -167,42 +119,36 @@ def collect():
                 break
             except Exception:
                 pass
-
-        page.wait_for_timeout(6000)  # let late XHR / rendering settle
+        page.wait_for_timeout(6000)
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
-
         try:
-            body_text = page.inner_text("body")
+            text = page.inner_text("body")
         except Exception:
-            body_text = ""
-
+            text = ""
         browser.close()
-
-    for data in captured_json:
-        walk_json(data, matches)
-    scan_text(body_text, matches)
-    return matches
+    return text
 
 
-# --------------------------------------------------------------- telegram ---
 def send(message):
-    import urllib.parse
-    import urllib.request
-
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = urllib.parse.urlencode(
-        {"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": "false"}
+        {"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": "true"}
     ).encode()
     with urllib.request.urlopen(urllib.request.Request(api, data=payload), timeout=30) as r:
         r.read()
 
 
-# ------------------------------------------------------------------- main ---
+def fingerprint(rec):
+    key = f"{rec['type']}|{rec['ask']}|{rec['orig']}"
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
 def main():
-    matches = collect()
+    text = render_text(URL)
+    listings = parse_listings(text)
 
     seen = set()
     if STATE.exists():
@@ -210,31 +156,33 @@ def main():
             seen = set(json.loads(STATE.read_text()))
         except Exception:
             seen = set()
-
     new_seen = set(seen)
+
     alerts = []
-    for text, price in matches:
-        if not is_match(text, price):
+    for rec in listings:
+        if rec["ask"] is None or rec["ask"] > MAX_PRICE:
             continue
-        fp = fingerprint(text, price)
+        if EVENT_KEYWORD and EVENT_KEYWORD not in rec["ctx"]:
+            continue
+        fp = fingerprint(rec)
         if fp in seen:
             continue
         new_seen.add(fp)
-        alerts.append((price, text))
+        alerts.append(rec)
 
-    # de-dup identical alerts within this run
-    alerts = sorted(set(alerts))
+    alerts.sort(key=lambda r: r["ask"])
 
     if alerts:
-        lines = [f"🎟️ Liputon: {len(alerts)} new match under €{MAX_PRICE:.0f}", ""]
-        for price, text in alerts[:10]:
-            snippet = re.sub(r"\s+", " ", text).strip()[:120]
-            lines.append(f"• €{price:.2f} — {snippet}")
+        lines = [f"🎟️ Liputon: {len(alerts)} new 3-day under €{MAX_PRICE:.0f}", ""]
+        for r in alerts[:10]:
+            orig = f" (orig €{r['orig']:.0f})" if r["orig"] else ""
+            lines.append(f"• €{r['ask']:.2f}{orig} — {r['type']}")
         lines += ["", URL]
         send("\n".join(lines))
 
     STATE.write_text(json.dumps(sorted(new_seen)))
-    print(f"Checked. {len(matches)} candidate(s), {len(alerts)} new alert(s).")
+    under = sum(1 for r in listings if r["ask"] is not None and r["ask"] <= MAX_PRICE)
+    print(f"Checked. {len(listings)} 3-day listing(s), {under} under EUR {MAX_PRICE:.0f}, {len(alerts)} new alert(s).")
 
 
 if __name__ == "__main__":
