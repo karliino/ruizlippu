@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-Liputon.fi resale monitor
---------------------------
-Pings a Telegram chat when a 3-day Ruisrock ticket is being SOLD (the seller's
-asking price / HINTA) at or below a price you set.
+Liputon.fi resale monitor — fast-loop edition
+---------------------------------------------
+Each run boots the browser ONCE, then re-checks the Ruisrock resale page
+every ~15 seconds for a few minutes before exiting. Combined with a
+trigger every 5 min (cron-job.org), that gives near-continuous coverage
+instead of a single check per cycle.
 
-It deliberately reads HINTA (asking price), NOT ALKUP. HINTA (original price).
-It opens the page in a headless browser, so there is no hidden API to grab.
+Reads the seller's asking price (HINTA), not the original (ALKUP. HINTA),
+and puts a direct buy link at the top of each Telegram alert.
 
 Environment variables (set in the GitHub workflow):
   TELEGRAM_BOT_TOKEN   (secret)  token from @BotFather
   TELEGRAM_CHAT_ID     (secret)  your numeric Telegram user id
   LIPUTON_URL          the Ruisrock resale page to watch
   MAX_PRICE            only alert when the ASKING price is <= this (euros)
-  EVENT_KEYWORD        optional safety filter, e.g. "ruisrock" (usually not needed)
+  EVENT_KEYWORD        optional safety filter, e.g. "ruisrock"
+  LOOP_SECONDS         how long each run keeps checking (default 180)
+  CHECK_EVERY          seconds between checks within a run (default 15)
 """
 
 import os
 import re
 import json
+import time
 import hashlib
 import pathlib
 import urllib.parse
@@ -39,14 +44,13 @@ CHAT_ID       = _req("TELEGRAM_CHAT_ID")
 URL           = os.environ.get("LIPUTON_URL", "https://www.liputon.fi/events/110487").strip()
 MAX_PRICE     = float(os.environ.get("MAX_PRICE", "170").replace(",", "."))
 EVENT_KEYWORD = os.environ.get("EVENT_KEYWORD", "").strip().lower()
+LOOP_SECONDS  = int(os.environ.get("LOOP_SECONDS", "180"))
+CHECK_EVERY   = int(os.environ.get("CHECK_EVERY", "15"))
 
 STATE = pathlib.Path("state.json")
 
-# A euro amount, either "236,00 €" or "€ 236,00".
 EURO = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*€|€\s*(\d{1,4}(?:[.,]\d{1,2})?)")
-# The listing format puts the number before the € sign.
 EURO_NUM = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*€")
-# Marks a 3-day / weekend pass.
 MARKER = re.compile(
     r"3\s*-?\s*(?:PÄIVÄÄ|PAIVAA|PÄIVÄN|PAIVAN|päivää|päivän|paivaa|paivan|pv|vrk)"
     r"|kolmen\s+päiv|kolmen\s+paiv|3-day\b|3 day\b",
@@ -73,11 +77,8 @@ def to_price(value):
 
 
 def parse_listings(text):
-    """
-    For each 3-day pass, the ASKING price (HINTA) is the first euro amount
-    after the '3 PÄIVÄÄ' marker; the original price (ALKUP. HINTA) is the
-    second. Returns one record per listing.
-    """
+    """ASKING price (HINTA) is the first euro after the '3 PÄIVÄÄ' marker;
+    original (ALKUP. HINTA) is the second."""
     out = []
     for m in MARKER.finditer(text):
         after = text[m.end(): m.end() + 150]
@@ -97,39 +98,38 @@ def parse_listings(text):
     return out
 
 
-def render_text(url):
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(locale="fi-FI")
+def accept_cookies(page):
+    for sel in (
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "text=Salli kaikki",
+        "text=Hyväksy kaikki",
+        "text=Hyväksy",
+        "text=Accept all",
+    ):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            print("Navigation warning:", e)
-        # Best-effort cookie accept so listings render.
-        for sel in (
-            "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
-            "#CybotCookiebotDialogBodyButtonAccept",
-            "text=Salli kaikki",
-            "text=Hyväksy kaikki",
-            "text=Hyväksy",
-            "text=Accept all",
-        ):
-            try:
-                page.click(sel, timeout=1500)
-                break
-            except Exception:
-                pass
-        page.wait_for_timeout(6000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
+            page.click(sel, timeout=1500)
+            return
         except Exception:
             pass
-        try:
-            text = page.inner_text("body")
-        except Exception:
-            text = ""
-        browser.close()
-    return text
+
+
+def check_page(page):
+    """Reload the page once and return the current 3-day listings."""
+    try:
+        page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        print("nav warning:", e)
+    page.wait_for_timeout(3500)
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        text = ""
+    return parse_listings(text)
 
 
 def send(message):
@@ -141,48 +141,80 @@ def send(message):
         r.read()
 
 
+def send_alert(records):
+    lines = [f"🎟️ {len(records)} Ruisrock 3-day under €{MAX_PRICE:.0f}!",
+             f"👉 BUY: {URL}", ""]
+    for r in records[:10]:
+        orig = f" (orig €{r['orig']:.0f})" if r["orig"] else ""
+        lines.append(f"• €{r['ask']:.2f}{orig} — {r['type']}")
+    send("\n".join(lines))
+
+
 def fingerprint(rec):
-    key = f"{rec['type']}|{rec['ask']}|{rec['orig']}"
-    return hashlib.sha1(key.encode()).hexdigest()[:16]
+    return hashlib.sha1(f"{rec['type']}|{rec['ask']}|{rec['orig']}".encode()).hexdigest()[:16]
+
+
+def load_state():
+    if STATE.exists():
+        try:
+            return set(json.loads(STATE.read_text()))
+        except Exception:
+            return set()
+    return set()
 
 
 def main():
-    text = render_text(URL)
-    listings = parse_listings(text)
-
-    seen = set()
-    if STATE.exists():
-        try:
-            seen = set(json.loads(STATE.read_text()))
-        except Exception:
-            seen = set()
+    seen = load_state()
     new_seen = set(seen)
+    loop_end = time.time() + LOOP_SECONDS
+    checks = 0
+    total_alerts = 0
 
-    alerts = []
-    for rec in listings:
-        if rec["ask"] is None or rec["ask"] > MAX_PRICE:
-            continue
-        if EVENT_KEYWORD and EVENT_KEYWORD not in rec["ctx"]:
-            continue
-        fp = fingerprint(rec)
-        if fp in seen:
-            continue
-        new_seen.add(fp)
-        alerts.append(rec)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(locale="fi-FI")
+        first = True
 
-    alerts.sort(key=lambda r: r["ask"])
+        while time.time() < loop_end:
+            t0 = time.time()
+            try:
+                listings = check_page(page)
+                if first:
+                    accept_cookies(page)          # only needed once
+                    first = False
+                    listings = check_page(page)    # re-read after consent
+                checks += 1
 
-    if alerts:
-        lines = [f"🎟️ Liputon: {len(alerts)} new 3-day under €{MAX_PRICE:.0f}", ""]
-        for r in alerts[:10]:
-            orig = f" (orig €{r['orig']:.0f})" if r["orig"] else ""
-            lines.append(f"• €{r['ask']:.2f}{orig} — {r['type']}")
-        lines += ["", URL]
-        send("\n".join(lines))
+                batch = []
+                for rec in listings:
+                    if rec["ask"] is None or rec["ask"] > MAX_PRICE:
+                        continue
+                    if EVENT_KEYWORD and EVENT_KEYWORD not in rec["ctx"]:
+                        continue
+                    fp = fingerprint(rec)
+                    if fp in new_seen:
+                        continue
+                    new_seen.add(fp)
+                    batch.append(rec)
+
+                if batch:
+                    send_alert(batch)
+                    total_alerts += len(batch)
+                    print(f"  ALERT: {len(batch)} new (cheapest €{min(r['ask'] for r in batch):.2f})")
+            except Exception as e:
+                print("check error:", e)
+
+            # pace to CHECK_EVERY, without overshooting the loop window
+            to_sleep = CHECK_EVERY - (time.time() - t0)
+            if time.time() >= loop_end:
+                break
+            if to_sleep > 0:
+                time.sleep(min(to_sleep, max(0, loop_end - time.time())))
+
+        browser.close()
 
     STATE.write_text(json.dumps(sorted(new_seen)))
-    under = sum(1 for r in listings if r["ask"] is not None and r["ask"] <= MAX_PRICE)
-    print(f"Checked. {len(listings)} 3-day listing(s), {under} under EUR {MAX_PRICE:.0f}, {len(alerts)} new alert(s).")
+    print(f"Done. {checks} checks in ~{LOOP_SECONDS}s, {total_alerts} alert(s).")
 
 
 if __name__ == "__main__":
